@@ -11,8 +11,8 @@
 // in the remaining fields with default values.
 #![allow(clippy::needless_update)]
 
-#[cfg(target_os = "windows")]
-compile_error!("symphonia-play does not support Windows");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("symphonia-play supports only Linux and macOS");
 
 use std::process::ExitCode;
 
