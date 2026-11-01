@@ -43,6 +43,14 @@ youtube-dl -f 140 <url> -o - | symphonia-play -
 yt-dlp -f 140 <url> -o - | symphonia-play -
 ```
 
+## Building
+
+The `dist` profile uses `panic = "immediate-abort"` and builds the standard library from source. Use the provided alias:
+
+```bash
+cargo dist
+```
+
 ## License
 
 Symphonia is provided under the MPL v2.0 license. Please refer to the LICENSE file for more details.
