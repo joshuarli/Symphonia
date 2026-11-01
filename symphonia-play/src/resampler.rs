@@ -74,7 +74,6 @@ where
             spec_in.rate() as usize,
             out_sample_rate as usize,
             chunk_size,
-            1,
             spec_in.channels().count(),
             rubato::FixedSync::Input,
         )
@@ -129,7 +128,7 @@ where
 
 struct AudioBufferAdapter<'a, S: Sample>(&'a AudioBuffer<S>);
 
-unsafe impl<'a, T> rubato::audioadapter::Adapter<'a, T> for AudioBufferAdapter<'a, T>
+unsafe impl<T> rubato::audioadapter::Adapter<T> for AudioBufferAdapter<'_, T>
 where
     T: Sample,
 {
@@ -148,7 +147,7 @@ where
 
 struct AudioBufferAdapterMut<'a, S: Sample>(&'a mut AudioBuffer<S>);
 
-unsafe impl<'a, T> rubato::audioadapter::Adapter<'a, T> for AudioBufferAdapterMut<'a, T>
+unsafe impl<T> rubato::audioadapter::Adapter<T> for AudioBufferAdapterMut<'_, T>
 where
     T: Sample,
 {
@@ -165,7 +164,7 @@ where
     }
 }
 
-unsafe impl<'a, T> rubato::audioadapter::AdapterMut<'a, T> for AudioBufferAdapterMut<'a, T>
+unsafe impl<T> rubato::audioadapter::AdapterMut<T> for AudioBufferAdapterMut<'_, T>
 where
     T: Sample,
 {

@@ -350,7 +350,7 @@ mod cpal {
             let (ring_buf_producer, ring_buf_consumer) = (ring_buf.producer(), ring_buf.consumer());
 
             let stream_result = device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                     // Write out as many samples as possible from the ring buffer to the audio
                     // output.
