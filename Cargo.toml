@@ -44,6 +44,13 @@ inherits = "release"
 debug = true
 #rustflags = ["-C", "force-frame-pointers=y"]
 
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [workspace.lints.clippy]
 unwrap_used = "warn"
 
