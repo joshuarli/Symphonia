@@ -537,7 +537,7 @@ pub fn print_pair_value(value: &str, lead: usize) {
                         .by_ref()
                         .filter(text::filter::not_c1_control)
                         .enumerate()
-                        .take_while(|(i, c)| *i <= 60 || *i <= 80 && !c.is_whitespace())
+                        .take_while(|(i, c)| *i <= 60 || *i <= 80 && !c.is_ascii_whitespace())
                         .map(|(_, c)| {
                             if text::filter::c0_control(&c) {
                                 char::from_u32(0x2400 + c as u32).expect(

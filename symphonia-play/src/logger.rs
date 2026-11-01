@@ -109,7 +109,7 @@ impl Filter {
 
         let mut filter = Filter { directives: Vec::new(), message: None };
 
-        for directive in directives.split(',').map(str::trim) {
+        for directive in directives.split(',').map(str::trim_ascii) {
             if directive.is_empty() {
                 continue;
             }
@@ -180,9 +180,9 @@ impl Directive {
 
 fn parse_directive(spec: &str) -> Option<Directive> {
     let mut parts = spec.split('=');
-    let target = parts.next().unwrap_or_default().trim();
+    let target = parts.next().unwrap_or_default().trim_ascii();
 
-    match (parts.next().map(str::trim), parts.next()) {
+    match (parts.next().map(str::trim_ascii), parts.next()) {
         (None, None) => match target.parse() {
             Ok(level) => Some(Directive { target: None, level }),
             Err(_) => {

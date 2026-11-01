@@ -625,7 +625,7 @@ fn dump_visuals(format: &mut Box<dyn FormatReader>, file_name: &OsStr) {
 }
 
 fn dump_visual(visual: &Visual, file_name: &OsStr, index: usize) {
-    let extension = match visual.media_type.as_ref().map(|m| m.to_lowercase()).as_deref() {
+    let extension = match visual.media_type.as_ref().map(|m| m.to_ascii_lowercase()).as_deref() {
         Some("image/bmp") => ".bmp",
         Some("image/gif") => ".gif",
         Some("image/jpeg") => ".jpg",

@@ -36,7 +36,7 @@ where
         Ok(Invocation::Run(args)) => match crate::player::run(&args) {
             Ok(code) => ExitCode::from(code as u8),
             Err(err) => {
-                log::error!("{}", err.to_string().to_lowercase());
+                log::error!("{}", err.to_string().to_ascii_lowercase());
                 ExitCode::from(255)
             }
         },
