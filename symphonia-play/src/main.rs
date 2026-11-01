@@ -14,6 +14,7 @@
 use std::process::ExitCode;
 
 mod cli;
+mod logger;
 mod output;
 mod player;
 mod ui;

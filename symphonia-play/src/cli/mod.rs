@@ -22,7 +22,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
-    let _ = pretty_env_logger::try_init();
+    crate::logger::init();
 
     match parse(args) {
         Ok(Invocation::Help) => {
