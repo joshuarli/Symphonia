@@ -11,16 +11,17 @@
 // in the remaining fields with default values.
 #![allow(clippy::needless_update)]
 
+#[cfg(target_os = "windows")]
+compile_error!("symphonia-play does not support Windows");
+
 use std::process::ExitCode;
 
 mod cli;
 mod logger;
 mod output;
 mod player;
-mod ui;
-
-#[cfg(not(target_os = "linux"))]
 mod resampler;
+mod ui;
 
 fn main() -> ExitCode {
     cli::run(std::env::args_os())
