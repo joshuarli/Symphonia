@@ -174,3 +174,29 @@ where
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Resampler;
+    use symphonia::core::audio::{AudioBuffer, AudioSpec, Channels};
+
+    #[test]
+    fn resamples_to_the_output_rate() {
+        let spec_in = AudioSpec::new(44_100, Channels::Discrete(1));
+        let mut resampler = Resampler::<f32>::new(&spec_in, 48_000, 1024);
+
+        let mut input = AudioBuffer::<f32>::new(spec_in, 1500);
+        input.render_silence(Some(1500));
+
+        let mut output = Vec::new();
+        let samples = resampler.resample((&input).into(), &mut output);
+
+        assert!(!samples.is_empty());
+        assert!(samples.iter().all(|sample| *sample == 0.0));
+
+        let flushed = resampler.flush(&mut output);
+
+        assert!(!flushed.is_empty());
+        assert!(flushed.iter().all(|sample| *sample == 0.0));
+    }
+}
