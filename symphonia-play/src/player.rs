@@ -1,0 +1,430 @@
+// Symphonia
+// Copyright (c) 2019-2026 The Project Symphonia Developers.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::Write;
+
+use log::{info, warn};
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::{AudioDecoderOptions, FinalizeResult};
+use symphonia::core::errors::{Error, Result};
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::io::{MediaSource, MediaSourceStream, ReadOnlySource};
+use symphonia::core::meta::{MetadataOptions, Visual};
+use symphonia::core::units::{Duration, Time, Timestamp};
+
+use crate::cli::args::Args;
+use crate::output;
+use crate::ui;
+
+#[derive(Copy, Clone)]
+enum SeekPosition {
+    Time(Time),
+    Timestamp(Timestamp),
+}
+
+pub fn run(args: &Args) -> Result<i32> {
+    let path = &args.input;
+
+    // Create a hint to help the format registry guess what format reader is appropriate.
+    let mut hint = Hint::new();
+
+    // If the path string is '-' then read from standard input.
+    let source = if path.as_os_str() == "-" {
+        Box::new(ReadOnlySource::new(std::io::stdin())) as Box<dyn MediaSource>
+    }
+    else {
+        // Othwerise, get a Path from the path string.
+
+        // Provide the file extension as a hint.
+        if let Some(extension) = path.extension() {
+            if let Some(extension_str) = extension.to_str() {
+                hint.with_extension(extension_str);
+            }
+        }
+
+        Box::new(File::open(path)?)
+    };
+
+    // Create the media source stream using the boxed media source from above.
+    let mss = MediaSourceStream::new(source, Default::default());
+
+    // Use the default options for format readers other than for gapless playback.
+    let fmt_opts: FormatOptions = Default::default();
+
+    // Use the default options for metadata readers.
+    let meta_opts: MetadataOptions = Default::default();
+
+    // Probe the media source stream for metadata and get the format reader.
+    match symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts) {
+        Ok(mut format) => {
+            // Dump visuals if requested.
+            if args.dump_visuals {
+                let name = match path.file_name() {
+                    Some(name) if name != "-" => name,
+                    _ => OsStr::new("NoName"),
+                };
+
+                dump_visuals(&mut format, name);
+            }
+
+            // Get the value of the track number option, if provided.
+            let track_num = args.track;
+
+            let dec_opts = AudioDecoderOptions::default().gapless(!args.no_gapless);
+
+            // Select the operating mode.
+            if args.probe_only {
+                // Probe-only mode only prints information about the format, tracks, metadata, etc.
+                ui::print_format(path, &mut format);
+                Ok(0)
+            }
+            else if args.verify_only {
+                // Verify-only mode decodes and verifies the audio, but does not play it.
+                let opts = DecodeOptions { dec_opts: dec_opts.verify(true), track_num };
+                decode_only(format, opts)
+            }
+            else if args.decode_only {
+                // Decode-only mode decodes the audio, but does not play or verify it.
+                let opts = DecodeOptions { dec_opts: dec_opts.verify(false), track_num };
+
+                decode_only(format, opts)
+            }
+            else {
+                // Playback mode.
+                ui::print_format(path, &mut format);
+
+                // If present, parse the seek argument.
+                let seek_pos = if let Some(time) = args.seek {
+                    Time::try_from_secs_f64(time).map(SeekPosition::Time)
+                }
+                else {
+                    args.seek_ts.map(|ts| SeekPosition::Timestamp(Timestamp::new(ts)))
+                };
+
+                // Setup playback options.
+                let opts = PlayOptions {
+                    decoder_opts: dec_opts.verify(args.verify),
+                    track_num,
+                    seek_pos,
+                    no_progress: args.no_progress,
+                };
+
+                // Play it!
+                play(format, opts)
+            }
+        }
+        Err(err) => {
+            // The input was not supported by any format reader.
+            info!("the input is not supported");
+            Err(err)
+        }
+    }
+}
+
+/// Options for the decode command.
+#[derive(Copy, Clone)]
+struct DecodeOptions {
+    dec_opts: AudioDecoderOptions,
+    track_num: Option<usize>,
+}
+
+fn decode_only(mut reader: Box<dyn FormatReader>, opts: DecodeOptions) -> Result<i32> {
+    // If the user provided a track number, select that track if it exists, otherwise, select the
+    // default audio track.
+    let track = opts
+        .track_num
+        .and_then(|t| reader.tracks().get(t))
+        .or_else(|| reader.default_track(TrackType::Audio));
+
+    // Return if no track has been found.
+    let track = match track {
+        Some(track) => track,
+        _ => return Ok(0),
+    };
+
+    // Get the audio codec parameters from the track. Return if the track is not an audio track, or
+    // does not have any codec parameters.
+    let codec_params = match track.codec_params.as_ref() {
+        Some(CodecParameters::Audio(audio)) => audio,
+        _ => return Ok(0),
+    };
+
+    // Create a decoder for the track.
+    let mut decoder =
+        symphonia::default::get_codecs().make_audio_decoder(codec_params, &opts.dec_opts)?;
+
+    // Save the track ID to filter demuxed packets.
+    let track_id = track.id;
+
+    // Decode all packets, ignoring all decode errors.
+    while let Some(packet) = reader.next_packet()? {
+        // If the packet does not belong to the selected track, skip over it.
+        if packet.track_id != track_id {
+            continue;
+        }
+
+        // Decode the packet into audio samples.
+        match decoder.decode(&packet) {
+            Ok(_decoded) => continue,
+            Err(Error::DecodeError(err)) => warn!("decode error: {err}"),
+            Err(err) => return Err(err),
+        }
+    }
+
+    info!("end of stream");
+
+    // Finalize the decoder and return the verification result if it's been enabled.
+    do_verification(decoder.finalize())
+}
+
+/// Options for the play command.
+#[derive(Copy, Clone)]
+struct PlayOptions {
+    decoder_opts: AudioDecoderOptions,
+    track_num: Option<usize>,
+    seek_pos: Option<SeekPosition>,
+    no_progress: bool,
+}
+
+/// Options for playing a single track.
+#[derive(Copy, Clone)]
+struct PlayTrackOptions {
+    decoder_opts: AudioDecoderOptions,
+    track_id: u32,
+    seek_ts: Timestamp,
+    no_progress: bool,
+}
+
+fn play(mut reader: Box<dyn FormatReader>, opts: PlayOptions) -> Result<i32> {
+    // If the user provided a track number, select that track if it exists, otherwise, select the
+    // default audio track.
+    let track = opts
+        .track_num
+        .and_then(|t| reader.tracks().get(t))
+        .or_else(|| reader.default_track(TrackType::Audio));
+
+    // Get the track ID for filtering packets. Return if no track has been found.
+    let mut track_id = match track {
+        Some(track) => track.id,
+        _ => return Ok(0),
+    };
+
+    // If seeking, seek the reader to the time or timestamp specified and get the timestamp of the
+    // seeked position.
+    let seek_ts = if let Some(seek_pos) = opts.seek_pos {
+        let seek_to = match seek_pos {
+            SeekPosition::Time(time) => SeekTo::Time { time, track_id: Some(track_id) },
+            SeekPosition::Timestamp(ts) => SeekTo::Timestamp { ts, track_id },
+        };
+
+        // Attempt the seek. If the seek fails, ignore the error and return a seek timestamp of 0 so
+        // that no samples are trimmed.
+        match reader.seek(SeekMode::Accurate, seek_to) {
+            Ok(seeked_to) => seeked_to.required_ts,
+            Err(Error::ResetRequired) => {
+                // Handle a demuxer reset.
+                track_id = match do_reset(&mut reader) {
+                    Some(id) => id,
+                    _ => return Ok(0),
+                };
+                Timestamp::ZERO
+            }
+            Err(err) => {
+                // Don't give-up on a seek error.
+                warn!("seek error: {err}");
+                Timestamp::ZERO
+            }
+        }
+    }
+    else {
+        // If not seeking, the seek timestamp is 0.
+        Timestamp::ZERO
+    };
+
+    let mut track_options = PlayTrackOptions {
+        decoder_opts: opts.decoder_opts,
+        track_id,
+        seek_ts,
+        no_progress: opts.no_progress,
+    };
+
+    // The audio output device.
+    let mut audio_output = None;
+
+    let result = loop {
+        match play_track(&mut reader, &mut audio_output, track_options) {
+            Err(Error::ResetRequired) => {
+                // Handle a demuxer reset.
+                track_options.track_id = match do_reset(&mut reader) {
+                    Some(id) => id,
+                    _ => return Ok(0),
+                };
+                track_options.seek_ts = Timestamp::ZERO;
+            }
+            res => break res,
+        }
+    };
+
+    // Flush the audio output to finish playing back any leftover samples.
+    if let Some(audio_output) = audio_output.as_mut() {
+        audio_output.flush()
+    }
+
+    result
+}
+
+fn play_track(
+    reader: &mut Box<dyn FormatReader>,
+    audio_output: &mut Option<Box<dyn output::AudioOutput>>,
+    opts: PlayTrackOptions,
+) -> Result<i32> {
+    // Get the selected track using the track ID.
+    let track = match reader.tracks().iter().find(|track| track.id == opts.track_id) {
+        Some(track) => track,
+        _ => return Ok(0),
+    };
+
+    // Get the audio codec parameters from the track. Return if the track is not an audio track, or
+    // does not have any codec parameters.
+    let codec_params = match track.codec_params.as_ref() {
+        Some(CodecParameters::Audio(audio)) => audio,
+        _ => return Ok(0),
+    };
+
+    // Create a decoder for the track.
+    let mut decoder =
+        symphonia::default::get_codecs().make_audio_decoder(codec_params, &opts.decoder_opts)?;
+
+    // Get the selected track's timebase and duration.
+    let tb = track.time_base;
+    let dur = track.duration;
+
+    // Decode and play the packets belonging to the selected track.
+    while let Some(packet) = reader.next_packet()? {
+        // If the packet does not belong to the selected track, skip it.
+        if packet.track_id != opts.track_id {
+            continue;
+        }
+
+        //Print out new metadata.
+        while !reader.metadata().is_latest() {
+            reader.metadata().pop();
+
+            if let Some(rev) = reader.metadata().current() {
+                ui::print_update(rev);
+            }
+        }
+
+        // Decode the packet into audio samples.
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                // If the audio output is not open, try to open it.
+                if audio_output.is_none() {
+                    // Get the capacity of the decoded buffer. Note that this is capacity, not
+                    // length! The output will use this to size its internal buffers appropriately.
+                    let duration = Duration::from(decoded.capacity() as u64);
+
+                    // Try to open the audio output.
+                    audio_output.replace(output::try_open(decoded.spec(), duration).map_err(
+                        |_| Error::IoError(std::io::Error::other("failed to open audio output")),
+                    )?);
+                }
+                else {
+                    // TODO: Check the audio spec. and duration hasn't changed.
+                }
+
+                // Write the decoded audio samples to the audio output if the presentation timestamp
+                // for the packet is >= the seeked position (0 if not seeking).
+                //
+                // NOTE: This is a half-baked approach to seeking! After seeking the reader, packets
+                // should be decoded and *samples* discarded up-to the exact *sample* indicated by
+                // required_ts. The current approach will discard extra samples if seeking to a
+                // sample within a packet.
+                if packet.pts >= opts.seek_ts {
+                    if !opts.no_progress {
+                        let _ = ui::print_progress(packet.pts, dur, tb);
+                    }
+
+                    if let Some(audio_output) = audio_output {
+                        audio_output.write(decoded).map_err(|_| {
+                            Error::IoError(std::io::Error::other("failed to write audio output"))
+                        })?;
+                    }
+                }
+            }
+            Err(Error::DecodeError(err)) => {
+                // Decode errors are not fatal. Print the error message and try to decode the next
+                // packet as usual.
+                warn!("decode error: {err}");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if !opts.no_progress {
+        println!();
+    }
+
+    info!("end of stream");
+
+    // Finalize the decoder and return the verification result if it's been enabled.
+    do_verification(decoder.finalize())
+}
+
+fn do_reset(reader: &mut Box<dyn FormatReader>) -> Option<u32> {
+    // The demuxer indicated that a reset is required. This is sometimes seen with streaming OGG
+    // (e.g., Icecast) wherein the entire contents of the container change (new tracks, codecs,
+    // metadata, etc.). Therefore, we must select a new track and recreate the decoder.
+    ui::print_blank();
+    ui::print_tracks(reader.tracks());
+
+    // Select the default audio track since the user's selected track number may no longer be exist
+    // or make sense.
+    reader.default_track(TrackType::Audio).map(|track| track.id)
+}
+
+fn do_verification(finalization: FinalizeResult) -> Result<i32> {
+    match finalization.verify_ok {
+        Some(is_ok) => {
+            // Got a verification result.
+            println!("verification: {}", if is_ok { "passed" } else { "failed" });
+
+            Ok(i32::from(!is_ok))
+        }
+        // Verification not enabled by user, or unsupported by the codec.
+        _ => Ok(0),
+    }
+}
+
+fn dump_visuals(format: &mut Box<dyn FormatReader>, file_name: &OsStr) {
+    if let Some(metadata) = format.metadata().current() {
+        for (i, visual) in metadata.media.visuals.iter().enumerate() {
+            dump_visual(visual, file_name, i);
+        }
+    }
+}
+
+fn dump_visual(visual: &Visual, file_name: &OsStr, index: usize) {
+    let extension = match visual.media_type.as_ref().map(|m| m.to_lowercase()).as_deref() {
+        Some("image/bmp") => ".bmp",
+        Some("image/gif") => ".gif",
+        Some("image/jpeg") => ".jpg",
+        Some("image/png") => ".png",
+        _ => ".bin",
+    };
+
+    let mut out_file_name = OsString::from(file_name);
+    out_file_name.push(format!("-{index:0>2}{extension}"));
+
+    if let Err(err) = File::create(out_file_name).and_then(|mut file| file.write_all(&visual.data))
+    {
+        warn!("failed to dump visual due to error {err}");
+    }
+}
