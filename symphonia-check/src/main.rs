@@ -12,6 +12,8 @@
 // in the remaining fields with default values.
 #![allow(clippy::needless_update)]
 
+mod logger;
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -373,7 +375,7 @@ fn run_test(path: &Path, opts: &TestOptions, result: &mut TestResult) -> Result<
 }
 
 fn main() {
-    pretty_env_logger::init();
+    logger::init();
 
     let matches = clap::Command::new("Symphonia Check")
         .version("1.0")
