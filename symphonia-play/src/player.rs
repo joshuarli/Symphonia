@@ -577,8 +577,12 @@ fn clamp_seek(
 
     match duration {
         Some(duration) => {
-            let end = start.checked_add(duration).unwrap_or(Timestamp::MAX);
-            target.min(end)
+            let last_seekable_ts = start
+                .checked_add(duration)
+                .unwrap_or(Timestamp::MAX)
+                .saturating_sub(Duration::new(1))
+                .max(start);
+            target.min(last_seekable_ts)
         }
         None => target,
     }
@@ -691,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn seek_forward_clamps_to_track_end() {
+    fn seek_forward_clamps_to_last_seekable_timestamp() {
         let target = clamp_seek(
             Timestamp::new(58_000),
             5,
@@ -700,7 +704,7 @@ mod tests {
             Some(Duration::new(60_000)),
         );
 
-        assert_eq!(target, Timestamp::new(60_000));
+        assert_eq!(target, Timestamp::new(59_999));
     }
 
     #[test]
