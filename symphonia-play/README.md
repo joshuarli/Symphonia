@@ -8,6 +8,13 @@ A simple audio player for testing Project Symphonia demuxers and decoders.
 # Play an audio file.
 symphonia-play /path/to/file
 
+# Play every supported audio file in a directory, in file name order.
+symphonia-play /path/to/directory
+
+# While playing: Left/Right seek 5 seconds, Ctrl+Left/Right (or [ and ]) change tracks,
+# and q, Esc, or Ctrl+C quit.
+symphonia-play /path/to/file
+
 # Play an audio file and verify the decoded audio whilst playing (some formats only).
 symphonia-play --verify /path/to/file
 

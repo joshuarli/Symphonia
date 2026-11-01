@@ -5,9 +5,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+mod input;
+mod playlist;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+use std::path::Path;
 
 use log::{info, warn};
 use symphonia::core::codecs::CodecParameters;
@@ -17,10 +21,12 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::{MetadataOptions, Visual};
-use symphonia::core::units::{Duration, Time, Timestamp};
+use symphonia::core::units::{Duration, Time, TimeBase, Timestamp};
 
 use crate::cli::args::Args;
 use crate::output;
+use crate::player::input::{Command, Keyboard};
+use crate::player::playlist::Playlist;
 use crate::ui;
 
 #[derive(Copy, Clone)]
@@ -30,8 +36,17 @@ enum SeekPosition {
 }
 
 pub fn run(args: &Args) -> Result<i32> {
-    let path = &args.input;
+    let mut playlist = Playlist::from_input(&args.input)?;
 
+    if args.probe_only || args.verify_only || args.decode_only {
+        process_playlist(&playlist, args)
+    }
+    else {
+        play_playlist(&mut playlist, args)
+    }
+}
+
+fn open_input(path: &Path) -> Result<Box<dyn FormatReader>> {
     // Create a hint to help the format registry guess what format reader is appropriate.
     let mut hint = Hint::new();
 
@@ -40,91 +55,74 @@ pub fn run(args: &Args) -> Result<i32> {
         Box::new(ReadOnlySource::new(std::io::stdin())) as Box<dyn MediaSource>
     }
     else {
-        // Othwerise, get a Path from the path string.
-
         // Provide the file extension as a hint.
-        if let Some(extension) = path.extension() {
-            if let Some(extension_str) = extension.to_str() {
-                hint.with_extension(extension_str);
-            }
+        if let Some(extension) = path.extension().and_then(OsStr::to_str) {
+            hint.with_extension(extension);
         }
 
         Box::new(File::open(path)?)
     };
 
-    // Create the media source stream using the boxed media source from above.
     let mss = MediaSourceStream::new(source, Default::default());
 
-    // Use the default options for format readers other than for gapless playback.
+    // Use the default options for format readers and metadata readers.
     let fmt_opts: FormatOptions = Default::default();
-
-    // Use the default options for metadata readers.
     let meta_opts: MetadataOptions = Default::default();
 
-    // Probe the media source stream for metadata and get the format reader.
     match symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts) {
-        Ok(mut format) => {
-            // Dump visuals if requested.
-            if args.dump_visuals {
-                let name = match path.file_name() {
-                    Some(name) if name != "-" => name,
-                    _ => OsStr::new("NoName"),
-                };
-
-                dump_visuals(&mut format, name);
-            }
-
-            // Get the value of the track number option, if provided.
-            let track_num = args.track;
-
-            let dec_opts = AudioDecoderOptions::default().gapless(!args.no_gapless);
-
-            // Select the operating mode.
-            if args.probe_only {
-                // Probe-only mode only prints information about the format, tracks, metadata, etc.
-                ui::print_format(path, &mut format);
-                Ok(0)
-            }
-            else if args.verify_only {
-                // Verify-only mode decodes and verifies the audio, but does not play it.
-                let opts = DecodeOptions { dec_opts: dec_opts.verify(true), track_num };
-                decode_only(format, opts)
-            }
-            else if args.decode_only {
-                // Decode-only mode decodes the audio, but does not play or verify it.
-                let opts = DecodeOptions { dec_opts: dec_opts.verify(false), track_num };
-
-                decode_only(format, opts)
-            }
-            else {
-                // Playback mode.
-                ui::print_format(path, &mut format);
-
-                // If present, parse the seek argument.
-                let seek_pos = if let Some(time) = args.seek {
-                    Time::try_from_secs_f64(time).map(SeekPosition::Time)
-                }
-                else {
-                    args.seek_ts.map(|ts| SeekPosition::Timestamp(Timestamp::new(ts)))
-                };
-
-                // Setup playback options.
-                let opts = PlayOptions {
-                    decoder_opts: dec_opts.verify(args.verify),
-                    track_num,
-                    seek_pos,
-                    no_progress: args.no_progress,
-                };
-
-                // Play it!
-                play(format, opts)
-            }
-        }
+        Ok(format) => Ok(format),
         Err(err) => {
             // The input was not supported by any format reader.
             info!("the input is not supported");
             Err(err)
         }
+    }
+}
+
+fn process_playlist(playlist: &Playlist, args: &Args) -> Result<i32> {
+    if !playlist.is_directory() {
+        return process_file(playlist.current(), args);
+    }
+
+    let mut succeeded = 0usize;
+
+    for (index, path) in playlist.paths().iter().enumerate() {
+        ui::print_line(format_args!("[{}/{}] {}", index + 1, playlist.len(), path.display()));
+
+        match process_file(path, args) {
+            Ok(0) => succeeded += 1,
+            Ok(_) => (),
+            Err(err) => warn!("failed to process '{}': {err}", path.display()),
+        }
+    }
+
+    Ok(if succeeded == 0 { 1 } else { 0 })
+}
+
+fn process_file(path: &Path, args: &Args) -> Result<i32> {
+    let mut format = open_input(path)?;
+
+    if args.dump_visuals {
+        dump_visuals(&mut format, display_name(path));
+    }
+
+    let dec_opts = AudioDecoderOptions::default().gapless(!args.no_gapless);
+    let track_num = args.track;
+
+    if args.probe_only {
+        // Probe-only mode only prints information about the format, tracks, metadata, etc.
+        ui::print_format(path, &mut format);
+        Ok(0)
+    }
+    else if args.verify_only {
+        // Verify-only mode decodes and verifies the audio, but does not play it.
+        let opts = DecodeOptions { dec_opts: dec_opts.verify(true), track_num };
+        decode_only(format, opts)
+    }
+    else {
+        // Decode-only mode decodes the audio, but does not play or verify it.
+        let opts = DecodeOptions { dec_opts: dec_opts.verify(false), track_num };
+        decode_only(format, opts)
     }
 }
 
@@ -184,13 +182,113 @@ fn decode_only(mut reader: Box<dyn FormatReader>, opts: DecodeOptions) -> Result
     do_verification(decoder.finalize())
 }
 
-/// Options for the play command.
-#[derive(Copy, Clone)]
-struct PlayOptions {
-    decoder_opts: AudioDecoderOptions,
-    track_num: Option<usize>,
-    seek_pos: Option<SeekPosition>,
-    no_progress: bool,
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Transition {
+    End,
+    Next,
+    Previous,
+    Quit,
+}
+
+struct FileOutcome {
+    transition: Transition,
+    verify_code: i32,
+}
+
+enum TrackAction {
+    End(i32),
+    Seek(Timestamp),
+    Next,
+    Previous,
+    Quit,
+}
+
+fn play_playlist(playlist: &mut Playlist, args: &Args) -> Result<i32> {
+    let keyboard_enabled = args.input.as_os_str() != "-" && std::io::stdin().is_terminal();
+
+    let keyboard = match Keyboard::new(keyboard_enabled) {
+        Ok(keyboard) => keyboard,
+        Err(err) => {
+            warn!("keyboard control unavailable: {err}");
+            Keyboard::disabled()
+        }
+    };
+
+    ui::set_raw_mode(keyboard.is_raw());
+
+    let initial_seek = initial_seek(args);
+    let mut apply_initial_seek = true;
+    let mut played_any = false;
+    let mut verification_failed = false;
+
+    loop {
+        let path = playlist.current();
+
+        if playlist.is_directory() {
+            let index = playlist.current_index();
+            ui::print_line(format_args!(
+                "[{}/{}] {}",
+                index + 1,
+                playlist.len(),
+                path.display()
+            ));
+        }
+
+        let seek_pos = if apply_initial_seek { initial_seek } else { None };
+        apply_initial_seek = false;
+
+        match play_file(path, args, seek_pos, !playlist.is_directory(), &keyboard) {
+            Ok(outcome) => {
+                if outcome.verify_code != 0 {
+                    verification_failed = true;
+                }
+
+                match outcome.transition {
+                    Transition::End => {
+                        played_any = true;
+
+                        if !playlist.advance() {
+                            break;
+                        }
+                    }
+                    Transition::Next => {
+                        played_any = true;
+                        playlist.next();
+                    }
+                    Transition::Previous => {
+                        played_any = true;
+                        playlist.previous();
+                    }
+                    Transition::Quit => {
+                        played_any = true;
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                if !playlist.is_directory() {
+                    return Err(err);
+                }
+
+                warn!("failed to play '{}': {err}", path.display());
+
+                if !playlist.advance() {
+                    break;
+                }
+            }
+        }
+    }
+
+    if verification_failed || !played_any { Ok(1) } else { Ok(0) }
+}
+
+fn initial_seek(args: &Args) -> Option<SeekPosition> {
+    if let Some(time) = args.seek {
+        Time::try_from_secs_f64(time).map(SeekPosition::Time)
+    }
+    else {
+        args.seek_ts.map(|ts| SeekPosition::Timestamp(Timestamp::new(ts)))
+    }
 }
 
 /// Options for playing a single track.
@@ -202,112 +300,193 @@ struct PlayTrackOptions {
     no_progress: bool,
 }
 
-fn play(mut reader: Box<dyn FormatReader>, opts: PlayOptions) -> Result<i32> {
+fn play_file(
+    path: &Path,
+    args: &Args,
+    seek_pos: Option<SeekPosition>,
+    print_format: bool,
+    keyboard: &Keyboard,
+) -> Result<FileOutcome> {
+    let mut reader = open_input(path)?;
+
+    if args.dump_visuals {
+        dump_visuals(&mut reader, display_name(path));
+    }
+
+    if print_format {
+        ui::print_format(path, &mut reader);
+    }
+
     // If the user provided a track number, select that track if it exists, otherwise, select the
     // default audio track.
-    let track = opts
-        .track_num
-        .and_then(|t| reader.tracks().get(t))
-        .or_else(|| reader.default_track(TrackType::Audio));
-
-    // Get the track ID for filtering packets. Return if no track has been found.
-    let mut track_id = match track {
-        Some(track) => track.id,
-        _ => return Ok(0),
+    let mut track_id = match select_track(&*reader, args.track) {
+        Some(track_id) => track_id,
+        None => {
+            return Ok(FileOutcome { transition: Transition::End, verify_code: 0 });
+        }
     };
 
-    // If seeking, seek the reader to the time or timestamp specified and get the timestamp of the
-    // seeked position.
-    let seek_ts = if let Some(seek_pos) = opts.seek_pos {
-        let seek_to = match seek_pos {
-            SeekPosition::Time(time) => SeekTo::Time { time, track_id: Some(track_id) },
-            SeekPosition::Timestamp(ts) => SeekTo::Timestamp { ts, track_id },
+    let mut seek_ts = match perform_seek(&mut reader, &mut track_id, seek_pos) {
+        Some(seek_ts) => seek_ts,
+        None => return Ok(FileOutcome { transition: Transition::End, verify_code: 0 }),
+    };
+
+    let decoder_opts = AudioDecoderOptions::default().gapless(!args.no_gapless).verify(args.verify);
+    let mut audio_output: Option<Box<dyn output::AudioOutput>> = None;
+
+    loop {
+        let opts = PlayTrackOptions {
+            decoder_opts,
+            track_id,
+            seek_ts,
+            no_progress: args.no_progress,
         };
 
-        // Attempt the seek. If the seek fails, ignore the error and return a seek timestamp of 0 so
-        // that no samples are trimmed.
-        match reader.seek(SeekMode::Accurate, seek_to) {
-            Ok(seeked_to) => seeked_to.required_ts,
+        match play_track(&mut reader, &mut audio_output, opts, keyboard) {
+            Ok(TrackAction::End(verify_code)) => {
+                // Flush the audio output to finish playing back any leftover samples.
+                if let Some(audio_output) = audio_output.as_mut() {
+                    audio_output.flush();
+                }
+
+                return Ok(FileOutcome { transition: Transition::End, verify_code });
+            }
+            Ok(TrackAction::Next) => {
+                return Ok(FileOutcome { transition: Transition::Next, verify_code: 0 });
+            }
+            Ok(TrackAction::Previous) => {
+                return Ok(FileOutcome { transition: Transition::Previous, verify_code: 0 });
+            }
+            Ok(TrackAction::Quit) => {
+                return Ok(FileOutcome { transition: Transition::Quit, verify_code: 0 });
+            }
+            Ok(TrackAction::Seek(target)) => {
+                let seek_pos = Some(SeekPosition::Timestamp(target));
+
+                match perform_seek(&mut reader, &mut track_id, seek_pos) {
+                    Some(seeked_ts) => seek_ts = seeked_ts,
+                    None => {
+                        return Ok(FileOutcome { transition: Transition::End, verify_code: 0 });
+                    }
+                }
+            }
             Err(Error::ResetRequired) => {
                 // Handle a demuxer reset.
                 track_id = match do_reset(&mut reader) {
                     Some(id) => id,
-                    _ => return Ok(0),
+                    None => {
+                        return Ok(FileOutcome { transition: Transition::End, verify_code: 0 });
+                    }
                 };
-                Timestamp::ZERO
+                seek_ts = Timestamp::ZERO;
             }
-            Err(err) => {
-                // Don't give-up on a seek error.
-                warn!("seek error: {err}");
-                Timestamp::ZERO
-            }
+            Err(err) => return Err(err),
         }
     }
-    else {
-        // If not seeking, the seek timestamp is 0.
-        Timestamp::ZERO
+}
+
+fn select_track(reader: &dyn FormatReader, track_num: Option<usize>) -> Option<u32> {
+    track_num
+        .and_then(|t| reader.tracks().get(t))
+        .or_else(|| reader.default_track(TrackType::Audio))
+        .map(|track| track.id)
+}
+
+fn perform_seek(
+    reader: &mut Box<dyn FormatReader>,
+    track_id: &mut u32,
+    seek_pos: Option<SeekPosition>,
+) -> Option<Timestamp> {
+    let seek_pos = match seek_pos {
+        Some(seek_pos) => seek_pos,
+        None => return Some(Timestamp::ZERO),
     };
 
-    let mut track_options = PlayTrackOptions {
-        decoder_opts: opts.decoder_opts,
-        track_id,
-        seek_ts,
-        no_progress: opts.no_progress,
+    let seek_to = match seek_pos {
+        SeekPosition::Time(time) => SeekTo::Time { time, track_id: Some(*track_id) },
+        SeekPosition::Timestamp(ts) => SeekTo::Timestamp { ts, track_id: *track_id },
     };
 
-    // The audio output device.
-    let mut audio_output = None;
-
-    let result = loop {
-        match play_track(&mut reader, &mut audio_output, track_options) {
-            Err(Error::ResetRequired) => {
-                // Handle a demuxer reset.
-                track_options.track_id = match do_reset(&mut reader) {
-                    Some(id) => id,
-                    _ => return Ok(0),
-                };
-                track_options.seek_ts = Timestamp::ZERO;
-            }
-            res => break res,
+    // Attempt the seek. If the seek fails, ignore the error and return a seek timestamp of 0 so
+    // that no samples are trimmed.
+    match reader.seek(SeekMode::Accurate, seek_to) {
+        Ok(seeked_to) => Some(seeked_to.required_ts),
+        Err(Error::ResetRequired) => {
+            // Handle a demuxer reset.
+            *track_id = do_reset(reader)?;
+            Some(Timestamp::ZERO)
         }
-    };
-
-    // Flush the audio output to finish playing back any leftover samples.
-    if let Some(audio_output) = audio_output.as_mut() {
-        audio_output.flush()
+        Err(err) => {
+            // Don't give-up on a seek error.
+            warn!("seek error: {err}");
+            Some(Timestamp::ZERO)
+        }
     }
-
-    result
 }
 
 fn play_track(
     reader: &mut Box<dyn FormatReader>,
     audio_output: &mut Option<Box<dyn output::AudioOutput>>,
     opts: PlayTrackOptions,
-) -> Result<i32> {
+    keyboard: &Keyboard,
+) -> Result<TrackAction> {
     // Get the selected track using the track ID.
     let track = match reader.tracks().iter().find(|track| track.id == opts.track_id) {
         Some(track) => track,
-        _ => return Ok(0),
+        _ => return Ok(TrackAction::End(0)),
     };
 
     // Get the audio codec parameters from the track. Return if the track is not an audio track, or
     // does not have any codec parameters.
     let codec_params = match track.codec_params.as_ref() {
         Some(CodecParameters::Audio(audio)) => audio,
-        _ => return Ok(0),
+        _ => return Ok(TrackAction::End(0)),
     };
 
     // Create a decoder for the track.
     let mut decoder =
         symphonia::default::get_codecs().make_audio_decoder(codec_params, &opts.decoder_opts)?;
 
-    // Get the selected track's timebase and duration.
+    // Get the selected track's timebase, duration, and start timestamp.
     let tb = track.time_base;
     let dur = track.duration;
+    let start_ts = track.start_ts;
+
+    // The timestamp of the most recently played packet, used as the origin for relative seeks.
+    let mut current_ts = opts.seek_ts;
 
     // Decode and play the packets belonging to the selected track.
     while let Some(packet) = reader.next_packet()? {
+        if let Some(command) = keyboard.poll() {
+            match command {
+                Command::SeekBy(offset_secs) => {
+                    match tb {
+                        Some(tb) => {
+                            let target = clamp_seek(current_ts, offset_secs, tb, start_ts, dur);
+
+                            // Drop the audio output so that stale buffered samples are discarded.
+                            *audio_output = None;
+
+                            return Ok(TrackAction::Seek(target));
+                        }
+                        None => warn!("cannot seek: the track has no time base"),
+                    }
+                }
+                Command::Next => {
+                    *audio_output = None;
+                    return Ok(TrackAction::Next);
+                }
+                Command::Previous => {
+                    *audio_output = None;
+                    return Ok(TrackAction::Previous);
+                }
+                Command::Quit => {
+                    *audio_output = None;
+                    return Ok(TrackAction::Quit);
+                }
+            }
+        }
+
         // If the packet does not belong to the selected track, skip it.
         if packet.track_id != opts.track_id {
             continue;
@@ -348,6 +527,8 @@ fn play_track(
                 // required_ts. The current approach will discard extra samples if seeking to a
                 // sample within a packet.
                 if packet.pts >= opts.seek_ts {
+                    current_ts = packet.pts;
+
                     if !opts.no_progress {
                         let _ = ui::print_progress(packet.pts, dur, tb);
                     }
@@ -369,13 +550,38 @@ fn play_track(
     }
 
     if !opts.no_progress {
-        println!();
+        ui::print_line(format_args!(""));
     }
 
     info!("end of stream");
 
     // Finalize the decoder and return the verification result if it's been enabled.
-    do_verification(decoder.finalize())
+    do_verification(decoder.finalize()).map(TrackAction::End)
+}
+
+fn clamp_seek(
+    current: Timestamp,
+    offset_secs: i64,
+    time_base: TimeBase,
+    start: Timestamp,
+    duration: Option<Duration>,
+) -> Timestamp {
+    let offset_nanos = offset_secs.unsigned_abs().saturating_mul(1_000_000_000);
+    let offset = time_base
+        .calc_timestamp(Time::from_nanos_u64(offset_nanos))
+        .unwrap_or(Timestamp::ZERO)
+        .get();
+
+    let offset = if offset_secs < 0 { offset.saturating_neg() } else { offset };
+    let target = Timestamp::new(current.get().saturating_add(offset)).max(start);
+
+    match duration {
+        Some(duration) => {
+            let end = start.checked_add(duration).unwrap_or(Timestamp::MAX);
+            target.min(end)
+        }
+        None => target,
+    }
 }
 
 fn do_reset(reader: &mut Box<dyn FormatReader>) -> Option<u32> {
@@ -394,12 +600,19 @@ fn do_verification(finalization: FinalizeResult) -> Result<i32> {
     match finalization.verify_ok {
         Some(is_ok) => {
             // Got a verification result.
-            println!("verification: {}", if is_ok { "passed" } else { "failed" });
+            ui::print_line(format_args!("verification: {}", if is_ok { "passed" } else { "failed" }));
 
             Ok(i32::from(!is_ok))
         }
         // Verification not enabled by user, or unsupported by the codec.
         _ => Ok(0),
+    }
+}
+
+fn display_name(path: &Path) -> &OsStr {
+    match path.file_name() {
+        Some(name) if name != "-" => name,
+        _ => OsStr::new("NoName"),
     }
 }
 
@@ -426,5 +639,102 @@ fn dump_visual(visual: &Visual, file_name: &OsStr, index: usize) {
     if let Err(err) = File::create(out_file_name).and_then(|mut file| file.write_all(&visual.data))
     {
         warn!("failed to dump visual due to error {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_seek;
+    use symphonia::core::units::{Duration, TimeBase, Timestamp};
+
+    fn millisecond_time_base() -> TimeBase {
+        TimeBase::try_new(1, 1000).expect("1/1000 is a valid time base")
+    }
+
+    #[test]
+    fn seek_forward_moves_by_five_seconds() {
+        let target = clamp_seek(
+            Timestamp::new(10_000),
+            5,
+            millisecond_time_base(),
+            Timestamp::ZERO,
+            Some(Duration::new(60_000)),
+        );
+
+        assert_eq!(target, Timestamp::new(15_000));
+    }
+
+    #[test]
+    fn seek_backward_moves_by_five_seconds() {
+        let target = clamp_seek(
+            Timestamp::new(10_000),
+            -5,
+            millisecond_time_base(),
+            Timestamp::ZERO,
+            Some(Duration::new(60_000)),
+        );
+
+        assert_eq!(target, Timestamp::new(5_000));
+    }
+
+    #[test]
+    fn seek_backward_clamps_to_track_start() {
+        let target = clamp_seek(
+            Timestamp::new(3_000),
+            -5,
+            millisecond_time_base(),
+            Timestamp::ZERO,
+            Some(Duration::new(60_000)),
+        );
+
+        assert_eq!(target, Timestamp::ZERO);
+    }
+
+    #[test]
+    fn seek_forward_clamps_to_track_end() {
+        let target = clamp_seek(
+            Timestamp::new(58_000),
+            5,
+            millisecond_time_base(),
+            Timestamp::ZERO,
+            Some(Duration::new(60_000)),
+        );
+
+        assert_eq!(target, Timestamp::new(60_000));
+    }
+
+    #[test]
+    fn seek_forward_is_unbounded_without_a_duration() {
+        let target =
+            clamp_seek(Timestamp::new(58_000), 5, millisecond_time_base(), Timestamp::ZERO, None);
+
+        assert_eq!(target, Timestamp::new(63_000));
+    }
+
+    #[test]
+    fn seek_clamps_to_a_nonzero_track_start() {
+        let target = clamp_seek(
+            Timestamp::new(1_500),
+            -5,
+            millisecond_time_base(),
+            Timestamp::new(1_000),
+            Some(Duration::new(60_000)),
+        );
+
+        assert_eq!(target, Timestamp::new(1_000));
+    }
+
+    #[test]
+    fn seek_uses_the_track_time_base() {
+        let time_base = TimeBase::try_new(1, 48_000).expect("1/48000 is a valid time base");
+        let target = clamp_seek(
+            Timestamp::new(480_000),
+            5,
+            time_base,
+            Timestamp::ZERO,
+            Some(Duration::new(4_800_000)),
+        );
+
+        assert_eq!(target, Timestamp::new(720_000));
     }
 }

@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lazy_static::lazy_static;
 use symphonia::core::codecs::{CodecInfo, CodecParameters, CodecProfile};
@@ -24,8 +25,24 @@ const MIN_PAD: usize = 20;
 /// The maximum padding for tag keys.
 const MAX_PAD: usize = 40;
 
+static RAW_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Select the line ending used for new output lines.
+///
+/// Raw mode on Unix disables output post-processing, so a bare line feed no longer returns the
+/// cursor to the start of the line.
+pub fn set_raw_mode(enabled: bool) {
+    RAW_MODE.store(enabled, Ordering::Relaxed);
+}
+
+/// Print one formatted line using the line ending selected by [`set_raw_mode`].
+pub fn print_line(args: std::fmt::Arguments<'_>) {
+    let line_ending = if RAW_MODE.load(Ordering::Relaxed) { "\r\n" } else { "\n" };
+    print!("{args}{line_ending}");
+}
+
 pub fn print_format(path: &Path, format: &mut Box<dyn FormatReader>) {
-    println!("+ {}", path.display());
+    print_line(format_args!("+ {}", path.display()));
 
     let format_info = format.format_info();
 
@@ -57,14 +74,14 @@ pub fn print_format(path: &Path, format: &mut Box<dyn FormatReader>) {
 
     print_chapters(format.chapters());
     print_attachments(format.attachments());
-    println!(":");
-    println!();
+    print_line(format_args!(":"));
+    print_line(format_args!(""));
 }
 
 pub fn print_update(rev: &MetadataRevision) {
     print_meta_revision(rev);
-    println!(":");
-    println!();
+    print_line(format_args!(":"));
+    print_line(format_args!(""));
 }
 
 pub fn print_media(media_info: &MediaInfo) {
@@ -475,7 +492,7 @@ impl std::fmt::Display for Bullet {
 pub fn print_one(value: &str, bullet: Bullet, depth: usize) {
     let indent = 5 * depth;
     // The format is: "|<INDENT><BULLET> <VALUE>"
-    println!("|{:indent$}{} {}", "", bullet, value)
+    print_line(format_args!("|{:indent$}{} {}", "", bullet, value))
 }
 
 /// Print a key-value pair as a plain, numbered, or bulleted list item in a hierarchical list.
@@ -545,23 +562,23 @@ pub fn print_pair_value(value: &str, lead: usize) {
                     print!("\u{21aa} ")
                 }
                 // Print sub-string.
-                println!("{seg}")
+                print_line(format_args!("{seg}"))
             }
         }
     }
     else {
-        println!();
+        print_line(format_args!(""));
     }
 }
 
 /// Print a list header.
 pub fn print_header(title: &str) {
-    println!("| // {title} //")
+    print_line(format_args!("| // {title} //"))
 }
 
 /// Print a blank list line.
 pub fn print_blank() {
-    println!("|")
+    print_line(format_args!("|"))
 }
 
 pub fn print_progress(
