@@ -19,7 +19,7 @@ aiff = ["symphonia-metadata/riff-id3"]
 wav = ["symphonia-metadata/riff-info"]
 
 [dependencies]
-extended = "0.1.0"
+extended = "0.2.0"
 log = { workspace = true }
 symphonia-core = { version = "0.6.1", path = "../symphonia-core" }
 
